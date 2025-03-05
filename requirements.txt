@@ -1,0 +1,10 @@
+pip install mmcv-full -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10/index.html
+pip install -r requirements.txt
+pip install -e .
+pip install mmcv-full -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10/index.html
+pip install segmentation-models-pytorch
+
+-r requirements/optional.txt
+-r requirements/runtime.txt
+-r requirements/tests.txt
+-r requirements/multimodal.txt
