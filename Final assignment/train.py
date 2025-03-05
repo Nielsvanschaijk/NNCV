@@ -109,6 +109,7 @@ def train_single_model(
     label_remap_function,        # e.g. remap_label_small / remap_label_medium / remap_label_big
     model_label="small",         # just a string to differentiate (small/medium/big)
 ):
+
     """
     Trains a single U-Net model on either small, medium, or big classes, according to label_remap_function.
     Returns the best validation loss.
@@ -224,8 +225,37 @@ def train_single_model(
     wandb.finish()
     return best_valid_loss
 
+def compose_predictions(
+    pred_small: torch.Tensor, 
+    pred_medium: torch.Tensor,
+    pred_big: torch.Tensor,
+    ignore_index=255
+):
+    """
+    Combine the three predictions so that:
+      small > medium > big > background
+    pred_small, pred_medium, pred_big have shape (B, H, W) each.
+    Returns a combined prediction of shape (B, H, W).
+    """
+    # Start with everything at ignore_index (255).
+    final = torch.full_like(pred_small, fill_value=ignore_index)
+
+    # Where small != 255, take small.
+    mask_small = (pred_small != ignore_index)
+    final[mask_small] = pred_small[mask_small]
+
+    # Where final is still 255 and medium != 255, take medium.
+    mask_medium = (final == ignore_index) & (pred_medium != ignore_index)
+    final[mask_medium] = pred_medium[mask_medium]
+
+    # Where final is still 255 and big != 255, take big.
+    mask_big = (final == ignore_index) & (pred_big != ignore_index)
+    final[mask_big] = pred_big[mask_big]
+
+    return final
+
 def get_args_parser():
-    parser = ArgumentParser("Training script for multiple U-Net models (small/medium/big).")
+    parser = ArgumentParser("Training script for multiple models (small/medium/big).")
     parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to Cityscapes data")
     parser.add_argument("--batch-size", type=int, default=4, help="Training batch size")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
@@ -236,7 +266,7 @@ def get_args_parser():
     return parser
 
 def main(args):
-    # Set seed for reproducibility
+    # Set seed
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
 
@@ -244,62 +274,206 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
+    # Initialize W&B once for the entire multi-model run
+    wandb.init(
+        project="5lsm0-cityscapes-segmentation",
+        name=args.experiment_id,
+        config=vars(args),
+        reinit=True
+    )
+
     # Basic transforms
     transform = Compose([
         ToImage(),
         Resize((256, 256)),
-        ToDtype(torch.float32, scale=True),
+        ToDtype(torch.float32, scale=True),  # scale to [0,1]
         Normalize((0.5,), (0.5,)),
     ])
 
-    # Load train/val splits from Cityscapes
+    # Datasets
     train_dataset = Cityscapes(args.data_dir, split="train", mode="fine", target_type="semantic", transforms=transform)
-    valid_dataset = Cityscapes(args.data_dir, split="val", mode="fine", target_type="semantic", transforms=transform)
+    valid_dataset = Cityscapes(args.data_dir, split="val",   mode="fine", target_type="semantic", transforms=transform)
 
     train_dataset = wrap_dataset_for_transforms_v2(train_dataset)
     valid_dataset = wrap_dataset_for_transforms_v2(valid_dataset)
 
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,  num_workers=args.num_workers)
     valid_dataloader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
+    # Models
     model_small = UNet(in_channels=3, n_classes=19).to(device)
-    _ = train_single_model(
-        args=args,
-        device=device,
-        train_dataloader=train_dataloader,
-        valid_dataloader=valid_dataloader,
-        model=model_small,
-        label_remap_function=remap_label_small,
-        model_label="small"
-    )
-
     model_medium = UNet(in_channels=3, n_classes=19).to(device)
-    _ = train_single_model(
-        args=args,
-        device=device,
-        train_dataloader=train_dataloader,
-        valid_dataloader=valid_dataloader,
-        model=model_medium,
-        label_remap_function=remap_label_medium,
-        model_label="medium"
-    )
-
     model_big = DeepLabV3Plus(
-    encoder_name="resnet101",     # or "resnet50", "mobilenet_v2", "timm-resnest101", etc.
-    encoder_weights="imagenet",   # use pretrained backbone weights
-    in_channels=3,
-    classes=19                    # Cityscapes has 19 valid train IDs
+        encoder_name="resnet101",
+        encoder_weights=None,  # <-- Do NOT load ImageNet pretrained weights
+        in_channels=3,
+        classes=19
     ).to(device)
-    
-    _ = train_single_model(
-        args=args,
-        device=device,
-        train_dataloader=train_dataloader,
-        valid_dataloader=valid_dataloader,
-        model=model_big,
-        label_remap_function=remap_label_big,
-        model_label="big"
-    )
+
+    # Optimizers
+    optimizer_small  = AdamW(model_small.parameters(),  lr=args.lr)
+    optimizer_medium = AdamW(model_medium.parameters(), lr=args.lr)
+    optimizer_big    = AdamW(model_big.parameters(),    lr=args.lr)
+
+    # Loss
+    criterion = nn.CrossEntropyLoss(ignore_index=255)
+
+    # Create an output directory
+    os.makedirs("checkpoints", exist_ok=True)
+
+    best_val_loss = float("inf")
+
+    ##########################################################
+    # TRAINING LOOP (all 3 models in the same loop)
+    ##########################################################
+    for epoch in range(args.epochs):
+        print(f"Epoch [{epoch+1}/{args.epochs}]")
+
+        # ---- TRAIN
+        model_small.train()
+        model_medium.train()
+        model_big.train()
+
+        train_losses_small = []
+        train_losses_medium = []
+        train_losses_big = []
+
+        for images, labels in train_dataloader:
+            images = images.to(device)
+            # Convert raw label to train_id
+            labels_trainid = convert_to_train_id(labels)
+
+            # SMALL
+            labels_small = remap_label_small(labels_trainid)
+            labels_small = labels_small.long().squeeze(1).to(device)
+
+            optimizer_small.zero_grad()
+            out_small = model_small(images)
+            loss_small = criterion(out_small, labels_small)
+            loss_small.backward()
+            optimizer_small.step()
+            train_losses_small.append(loss_small.item())
+
+            # MEDIUM
+            labels_medium = remap_label_medium(labels_trainid)
+            labels_medium = labels_medium.long().squeeze(1).to(device)
+
+            optimizer_medium.zero_grad()
+            out_medium = model_medium(images)
+            loss_medium = criterion(out_medium, labels_medium)
+            loss_medium.backward()
+            optimizer_medium.step()
+            train_losses_medium.append(loss_medium.item())
+
+            # BIG
+            labels_big = remap_label_big(labels_trainid)
+            labels_big = labels_big.long().squeeze(1).to(device)
+
+            optimizer_big.zero_grad()
+            out_big = model_big(images)
+            loss_big = criterion(out_big, labels_big)
+            loss_big.backward()
+            optimizer_big.step()
+            train_losses_big.append(loss_big.item())
+
+        avg_loss_small  = sum(train_losses_small)  / len(train_losses_small)
+        avg_loss_medium = sum(train_losses_medium) / len(train_losses_medium)
+        avg_loss_big    = sum(train_losses_big)    / len(train_losses_big)
+
+        # Log training losses
+        wandb.log({
+            "train_loss_small":  avg_loss_small,
+            "train_loss_medium": avg_loss_medium,
+            "train_loss_big":    avg_loss_big,
+            "epoch": epoch + 1
+        })
+
+        # ---- VALIDATION
+        model_small.eval()
+        model_medium.eval()
+        model_big.eval()
+
+        val_losses_small = []
+        val_losses_medium = []
+        val_losses_big = []
+
+        with torch.no_grad():
+            # We'll log just 1 composite image each epoch (for demonstration)
+            logged_images = False
+
+            for i, (images, labels) in enumerate(valid_dataloader):
+                images = images.to(device)
+                labels_trainid = convert_to_train_id(labels)
+
+                # SMALL
+                labels_small = remap_label_small(labels_trainid).long().squeeze(1).to(device)
+                out_small = model_small(images)
+                loss_small = criterion(out_small, labels_small)
+                val_losses_small.append(loss_small.item())
+
+                # MEDIUM
+                labels_medium = remap_label_medium(labels_trainid).long().squeeze(1).to(device)
+                out_medium = model_medium(images)
+                loss_medium = criterion(out_medium, labels_medium)
+                val_losses_medium.append(loss_medium.item())
+
+                # BIG
+                labels_big = remap_label_big(labels_trainid).long().squeeze(1).to(device)
+                out_big = model_big(images)
+                loss_big = criterion(out_big, labels_big)
+                val_losses_big.append(loss_big.item())
+
+                if not logged_images:
+                    # Generate predictions
+                    pred_small  = out_small.softmax(dim=1).argmax(dim=1)   # (B,H,W)
+                    pred_medium = out_medium.softmax(dim=1).argmax(dim=1)  # (B,H,W)
+                    pred_big    = out_big.softmax(dim=1).argmax(dim=1)     # (B,H,W)
+
+                    # Compose final prediction
+                    composed_pred = compose_predictions(
+                        pred_small, pred_medium, pred_big, ignore_index=255
+                    )
+                    # Convert to color for logging
+                    composed_pred_color = convert_train_id_to_color(composed_pred.unsqueeze(1))
+                    composed_pred_img = make_grid(composed_pred_color.cpu(), nrow=4)
+                    composed_pred_img = composed_pred_img.permute(1, 2, 0).numpy()
+
+                    # Convert ground-truth to color as well
+                    labels_color = convert_train_id_to_color(labels_trainid)
+                    labels_color_grid = make_grid(labels_color.cpu(), nrow=4)
+                    labels_color_grid = labels_color_grid.permute(1, 2, 0).numpy()
+
+                    wandb.log({
+                        "val_composed_prediction": [wandb.Image(composed_pred_img)],
+                        "val_ground_truth": [wandb.Image(labels_color_grid)],
+                    })
+                    logged_images = True
+
+        avg_val_small  = sum(val_losses_small)  / len(val_losses_small)
+        avg_val_medium = sum(val_losses_medium) / len(val_losses_medium)
+        avg_val_big    = sum(val_losses_big)    / len(val_losses_big)
+
+        val_loss = (avg_val_small + avg_val_medium + avg_val_big) / 3.0  # or define your own weighting
+
+        wandb.log({
+            "val_loss_small":  avg_val_small,
+            "val_loss_medium": avg_val_medium,
+            "val_loss_big":    avg_val_big,
+            "val_loss_combined": val_loss
+        })
+
+        # Save best combined model weights (optionally you can save each model separately too)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save({
+                "model_small": model_small.state_dict(),
+                "model_medium": model_medium.state_dict(),
+                "model_big": model_big.state_dict(),
+            }, os.path.join("checkpoints", f"best_models_epoch={epoch+1}_val={val_loss:.4f}.pth"))
+            print(f"New best model saved at epoch {epoch+1} with val_loss {val_loss:.4f}")
+
+    wandb.finish()
+    print("Training complete.")
 
 if __name__ == "__main__":
     parser = get_args_parser()
